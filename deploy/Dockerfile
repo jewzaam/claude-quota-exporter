@@ -18,7 +18,7 @@ RUN useradd --create-home --uid 10001 exporter
 USER exporter
 WORKDIR /home/exporter
 
-COPY --from=build /dist/*.whl /tmp/
+COPY --from=build --chown=exporter:exporter /dist/*.whl /tmp/
 RUN pip install --no-cache-dir --user /tmp/*.whl && rm -f /tmp/*.whl
 ENV PATH="/home/exporter/.local/bin:${PATH}"
 
