@@ -9,6 +9,10 @@ CONFIG_FILE ?= ./config.example.json
 IMAGE_NAME ?= $(PROJECT_NAME)
 IMAGE_TAG ?= $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' pyproject.toml)
 
+# Container builder: prefer docker, fall back to podman. Override with
+# DOCKER=<path> when neither is on PATH.
+DOCKER ?= $(shell command -v docker 2>/dev/null || command -v podman 2>/dev/null)
+
 ifeq ($(OS),Windows_NT)
     PY_SYS ?= py -3
     VENV_DIR ?= .venv
@@ -53,5 +57,6 @@ uninstall:  ## Remove the editable install from the venv
 run: install-dev  ## Run the exporter against $(CONFIG_FILE)
 	$(PYTHON) -m $(PACKAGE_NAME) --config $(CONFIG_FILE)
 
-build-image:  ## Build the OCI container image
-	docker build -t $(IMAGE_NAME):$(IMAGE_TAG) -f deploy/Dockerfile .
+build-image:  ## Build the OCI container image (docker or podman)
+	@if [ -z "$(DOCKER)" ]; then echo "build-image: no container builder on PATH (docker or podman). Set DOCKER=<path> to override." >&2; exit 1; fi
+	"$(DOCKER)" build -t $(IMAGE_NAME):$(IMAGE_TAG) -f deploy/Dockerfile .
