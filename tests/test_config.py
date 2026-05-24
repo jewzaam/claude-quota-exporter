@@ -10,11 +10,7 @@ from claude_quota_exporter.config import (
     DEFAULT_CREDENTIALS_PATH,
     DEFAULT_FETCH_TTL_SECONDS,
     DEFAULT_HOST,
-    DEFAULT_OAUTH_CLIENT_ID,
     DEFAULT_PORT,
-    DEFAULT_REFRESH_SKEW_SECONDS,
-    DEFAULT_REFRESH_URLS,
-    DEFAULT_REFRESH_USER_AGENT,
     Settings,
 )
 
@@ -64,37 +60,3 @@ class TestSettingsFromConfig:
         cfg.write_text("not json", encoding="utf-8")
         s = Settings.from_config(config_path=cfg)
         assert s.port == DEFAULT_PORT
-
-
-class TestRefreshKnobs:
-    def test_defaults(self, tmp_path: Path) -> None:
-        cfg = _write_cfg(tmp_path / "c.json", {})
-        s = Settings.from_config(config_path=cfg)
-        assert s.refresh_skew_seconds == DEFAULT_REFRESH_SKEW_SECONDS
-        assert s.refresh_urls == DEFAULT_REFRESH_URLS
-        assert s.oauth_client_id == DEFAULT_OAUTH_CLIENT_ID
-        assert s.refresh_user_agent == DEFAULT_REFRESH_USER_AGENT
-
-    def test_overrides_applied(self, tmp_path: Path) -> None:
-        cfg = _write_cfg(
-            tmp_path / "c.json",
-            {
-                "refresh_skew_seconds": 60,
-                "refresh_urls": ["https://x.example/oauth/token"],
-                "oauth_client_id": "custom-cid",
-                "refresh_user_agent": "custom-ua/9.9",
-            },
-        )
-        s = Settings.from_config(config_path=cfg)
-        assert s.refresh_skew_seconds == 60
-        assert s.refresh_urls == ["https://x.example/oauth/token"]
-        assert s.oauth_client_id == "custom-cid"
-        assert s.refresh_user_agent == "custom-ua/9.9"
-
-    def test_default_user_agent_includes_version(self, tmp_path: Path) -> None:
-        from claude_quota_exporter import __version__
-
-        cfg = _write_cfg(tmp_path / "c.json", {})
-        s = Settings.from_config(config_path=cfg)
-        assert __version__ in s.refresh_user_agent
-        assert "claude-quota-exporter" in s.refresh_user_agent

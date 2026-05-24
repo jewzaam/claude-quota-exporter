@@ -25,7 +25,7 @@ class QuotaCollector(Collector):
         self._fetcher = fetcher
 
     def collect(self) -> Iterable[Metric]:
-        # Force a refresh attempt at scrape time. Throttle inside Fetcher.
+        # Force a fetch attempt at scrape time. Throttle inside Fetcher.
         self._fetcher.refresh_if_due()
 
         utilization = GaugeMetricFamily(
@@ -75,31 +75,12 @@ class QuotaCollector(Collector):
 
         access_expiry = GaugeMetricFamily(
             "claude_quota_access_token_expires_at_seconds",
-            "Unix epoch seconds when the current OAuth access token expires",
+            "Unix epoch seconds when the current OAuth bearer expires",
         )
         token_expiry = self._fetcher.access_token_expires_at
         if token_expiry is not None:
             access_expiry.add_metric([], token_expiry)
         yield access_expiry
-
-        refresh_issued = GaugeMetricFamily(
-            "claude_quota_refresh_token_issued_at_seconds",
-            (
-                "Unix epoch seconds when the current refresh token was "
-                "first observed locally"
-            ),
-        )
-        rt_issued = self._fetcher.refresh_token_issued_at
-        if rt_issued is not None:
-            refresh_issued.add_metric([], rt_issued)
-        yield refresh_issued
-
-        last_refresh = GaugeMetricFamily(
-            "claude_quota_last_refresh_timestamp_seconds",
-            "Unix epoch seconds of the last successful OAuth refresh",
-        )
-        last_refresh.add_metric([], self._fetcher.last_refresh_at)
-        yield last_refresh
 
         creds_present = GaugeMetricFamily(
             "claude_quota_credentials_present",
@@ -107,26 +88,3 @@ class QuotaCollector(Collector):
         )
         creds_present.add_metric([], 1.0 if self._fetcher.has_credentials() else 0.0)
         yield creds_present
-
-        creds_writable = GaugeMetricFamily(
-            "claude_quota_credentials_writable",
-            "1 if the credentials file is writable for token rotation, else 0",
-        )
-        creds_writable.add_metric(
-            [], 1.0 if self._fetcher.credentials_writable else 0.0
-        )
-        yield creds_writable
-
-        refresh_success = CounterMetricFamily(
-            "claude_quota_refresh_success",
-            "Number of successful OAuth refreshes since process start",
-        )
-        refresh_success.add_metric([], float(self._fetcher.refresh_success_count))
-        yield refresh_success
-
-        refresh_failure = CounterMetricFamily(
-            "claude_quota_refresh_failure",
-            "Number of failed OAuth refreshes since process start",
-        )
-        refresh_failure.add_metric([], float(self._fetcher.refresh_failure_count))
-        yield refresh_failure
