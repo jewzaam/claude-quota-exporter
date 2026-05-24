@@ -35,7 +35,7 @@ def _build_handler(
                 self._send(status=200, body=b"ok\n", content_type="text/plain")
                 return
             if self.path == "/readyz":
-                if fetcher.last_success_at > 0.0:
+                if fetcher.has_credentials():
                     self._send(
                         status=200,
                         body=b"ready\n",

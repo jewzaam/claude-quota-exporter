@@ -34,11 +34,48 @@ Claude consumer (CI runner, agent, IDE, etc.).
 
 ## Endpoints
 
-| Path       | Purpose                                                       |
-|------------|---------------------------------------------------------------|
-| `/metrics` | Prometheus exposition. Triggers a throttled fetch on scrape.  |
-| `/healthz` | Liveness — `200` while the process is up.                     |
-| `/readyz`  | Readiness — `200` once at least one upstream fetch succeeded. |
+| Path       | Purpose                                                                 |
+|------------|-------------------------------------------------------------------------|
+| `/metrics` | Prometheus exposition. Triggers a throttled fetch on scrape.            |
+| `/healthz` | Liveness — `200` while the process is up.                               |
+| `/readyz`  | Readiness — `200` once the credentials file is loaded; `503` until then.|
+
+## Authentication and token refresh
+
+The exporter consumes an OAuth credentials file in the
+[Claude Code shape](https://code.claude.com/docs/en/authentication):
+
+```json
+{
+  "claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-...",
+    "refreshToken": "sk-ant-ort01-...",
+    "expiresAt": 1779580800694
+  }
+}
+```
+
+Other fields (`scopes`, `subscriptionType`, etc.) are preserved
+verbatim on write-back.
+
+The exporter refreshes proactively when the access token is within
+`refresh_skew_seconds` (default 300) of expiry, and reactively on a
+usage-endpoint `401` only when the local expiry math agrees the token
+is past its skew window AND no refresh has fired within the last skew
+window. Refresh tokens rotate on every successful refresh; the new
+pair is written back atomically (temp file + `os.replace`, source
+file mode preserved).
+
+**Writability contract.** `credentials_path` must be writable for the
+exporter to survive token rotation across process restarts. If the
+file is read-only the exporter still runs — refresh works in-memory
+only and the rotated pair is lost when the Pod restarts.
+`claude_quota_credentials_writable` reports the writability state.
+
+**Refresh-token expiry is not surfaced.** Anthropic's refresh
+endpoint does not return refresh-token expiry. The exporter exposes
+`claude_quota_refresh_token_issued_at_seconds` (when the current
+refresh token was first observed locally) as the closest proxy.
 
 ## Metrics
 
@@ -49,6 +86,13 @@ Claude consumer (CI runner, agent, IDE, etc.).
 | `claude_quota_fetch_success_total`            | counter | —         | Successful upstream fetches.                |
 | `claude_quota_fetch_failure_total`            | counter | —         | Failed upstream fetches.                    |
 | `claude_quota_last_fetch_timestamp_seconds`   | gauge   | —         | Unix epoch of the last successful fetch.    |
+| `claude_quota_access_token_expires_at_seconds`| gauge   | —         | Unix epoch when the cached access token expires (omitted when creds absent). |
+| `claude_quota_refresh_token_issued_at_seconds`| gauge   | —         | Unix epoch when the current refresh token was first observed (omitted when creds absent). |
+| `claude_quota_last_refresh_timestamp_seconds` | gauge   | —         | Unix epoch of the last successful OAuth refresh. |
+| `claude_quota_credentials_present`            | gauge   | —         | `1` if a valid credentials file is loaded, else `0`. |
+| `claude_quota_credentials_writable`           | gauge   | —         | `1` if the credentials file is writable for token rotation, else `0`. |
+| `claude_quota_refresh_success_total`          | counter | —         | Successful OAuth refreshes since process start. |
+| `claude_quota_refresh_failure_total`          | counter | —         | Failed OAuth refreshes since process start. |
 
 Buckets are discovered dynamically — every top-level dict in the API
 response containing `utilization` and `resets_at` is emitted as a
@@ -102,9 +146,16 @@ working file before editing — `config.local.json` is gitignored.
   "fetch_ttl_seconds": 120,
   "fetch_timeout_seconds": 10,
   "max_backoff_seconds": 3600,
+  "refresh_skew_seconds": 300,
   "log_level": "INFO"
 }
 ```
+
+`refresh_urls`, `oauth_client_id`, and `refresh_user_agent` are also
+overridable. Defaults match Claude Code today: refresh against both
+`platform.claude.com` and `console.anthropic.com` in order, public
+Claude Code client ID, exporter-versioned User-Agent. Most operators
+leave them at defaults.
 
 `credentials_path` must point at a file with the Claude Code creds
 shape:

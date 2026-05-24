@@ -42,6 +42,20 @@ pod, one token, scrape-driven.
   `python3` for Windows: on a bare Windows install `python3` triggers
   the Microsoft Store app execution alias and opens the Store instead
   of running Python. POSIX still uses `python3`.
+- Token contents never appear in logs.
+  [src/claude_quota_exporter/auth.py](src/claude_quota_exporter/auth.py)
+  `refresh()` and `write_back()` log only outcomes (URL, status,
+  RFC-6749 `error` code, success/failure). Review checklist before
+  merging changes to `auth.py`: grep the file for `access_token` and
+  `refresh_token` as `%s` arguments to a logger — should return
+  nothing.
+- `credentials_path` must be writable to survive token rotation
+  across process restarts. Startup probe in
+  [src/claude_quota_exporter/auth.py](src/claude_quota_exporter/auth.py)
+  `is_writable()` sets the `claude_quota_credentials_writable` gauge;
+  a mid-run `write_back()` failure latches the gauge to `0` for the
+  rest of the process lifetime and the exporter runs in-memory only
+  (rotated tokens lost on Pod restart). Operators alert on the gauge.
 
 ## Entry points
 
