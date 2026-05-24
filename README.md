@@ -40,42 +40,56 @@ Claude consumer (CI runner, agent, IDE, etc.).
 | `/healthz` | Liveness — `200` while the process is up.                               |
 | `/readyz`  | Readiness — `200` once the credentials file is loaded; `503` until then.|
 
-## Authentication and token refresh
+## Authentication
 
-The exporter consumes an OAuth credentials file in the
-[Claude Code shape](https://code.claude.com/docs/en/authentication):
+The exporter consumes a long-lived OAuth bearer token minted via
+`claude setup-token` (requires an active Claude Pro/Max subscription).
+Tokens are valid for approximately 1 year. The exporter does NOT
+refresh tokens — rotation is a manual operator action signalled by
+the `claude_quota_access_token_expires_at_seconds` gauge.
+
+### Mint a token
+
+```sh
+make mint-creds                                 # writes ./mint/.credentials.json
+make mint-creds MINT_DIR=/secure/path           # override location
+make mint-creds MINT_TTL_DAYS=180               # override expiry
+```
+
+The script wraps `claude setup-token` (interactive — paste the URL
+into your browser, paste the returned code back into the terminal)
+and writes a `credentials.json` of the shape:
 
 ```json
 {
   "claudeAiOauth": {
     "accessToken": "sk-ant-oat01-...",
-    "refreshToken": "sk-ant-ort01-...",
-    "expiresAt": 1779580800694
+    "expiresAt": 1811116800000
   }
 }
 ```
 
-Other fields (`scopes`, `subscriptionType`, etc.) are preserved
-verbatim on write-back.
+`expiresAt` is informational only — it records when you minted the
+token plus `MINT_TTL_DAYS` (default 365). The exporter does not act
+on it beyond emitting the gauge. Anthropic determines actual expiry
+server-side.
 
-The exporter refreshes proactively when the access token is within
-`refresh_skew_seconds` (default 300) of expiry, and reactively on a
-usage-endpoint `401` only when the local expiry math agrees the token
-is past its skew window AND no refresh has fired within the last skew
-window. Refresh tokens rotate on every successful refresh; the new
-pair is written back atomically (temp file + `os.replace`, source
-file mode preserved).
+### Rotate
 
-**Writability contract.** `credentials_path` must be writable for the
-exporter to survive token rotation across process restarts. If the
-file is read-only the exporter still runs — refresh works in-memory
-only and the rotated pair is lost when the Pod restarts.
-`claude_quota_credentials_writable` reports the writability state.
+Re-run `make mint-creds` and restart the exporter. Recommended alert:
+fire when `claude_quota_access_token_expires_at_seconds - time() <
+30 * 86400` (30 days from expiry).
 
-**Refresh-token expiry is not surfaced.** Anthropic's refresh
-endpoint does not return refresh-token expiry. The exporter exposes
-`claude_quota_refresh_token_issued_at_seconds` (when the current
-refresh token was first observed locally) as the closest proxy.
+### Why no refresh
+
+The first iteration of the exporter implemented the full OAuth
+refresh-token grant. It was over-engineered for this use case — the
+long-lived bearer is simpler, dodges the per-refresh-token rate-limit
+bucket on `/v1/oauth/token`, and matches Anthropic's headless-tool
+guidance (the `CLAUDE_CODE_OAUTH_TOKEN` env var pattern). The full
+refresh design is preserved in
+[docs/superpowers/specs/2026-05-24-oauth-refresh-design.md](docs/superpowers/specs/2026-05-24-oauth-refresh-design.md)
+for reference.
 
 ## Metrics
 
@@ -86,13 +100,8 @@ refresh token was first observed locally) as the closest proxy.
 | `claude_quota_fetch_success_total`            | counter | —         | Successful upstream fetches.                |
 | `claude_quota_fetch_failure_total`            | counter | —         | Failed upstream fetches.                    |
 | `claude_quota_last_fetch_timestamp_seconds`   | gauge   | —         | Unix epoch of the last successful fetch.    |
-| `claude_quota_access_token_expires_at_seconds`| gauge   | —         | Unix epoch when the cached access token expires (omitted when creds absent). |
-| `claude_quota_refresh_token_issued_at_seconds`| gauge   | —         | Unix epoch when the current refresh token was first observed (omitted when creds absent). |
-| `claude_quota_last_refresh_timestamp_seconds` | gauge   | —         | Unix epoch of the last successful OAuth refresh. |
+| `claude_quota_access_token_expires_at_seconds`| gauge   | —         | Unix epoch when the bearer token expires (informational; omitted when creds absent or expiresAt not set). |
 | `claude_quota_credentials_present`            | gauge   | —         | `1` if a valid credentials file is loaded, else `0`. |
-| `claude_quota_credentials_writable`           | gauge   | —         | `1` if the credentials file is writable for token rotation, else `0`. |
-| `claude_quota_refresh_success_total`          | counter | —         | Successful OAuth refreshes since process start. |
-| `claude_quota_refresh_failure_total`          | counter | —         | Failed OAuth refreshes since process start. |
 
 Buckets are discovered dynamically — every top-level dict in the API
 response containing `utilization` and `resets_at` is emitted as a
@@ -146,23 +155,18 @@ working file before editing — `config.local.json` is gitignored.
   "fetch_ttl_seconds": 120,
   "fetch_timeout_seconds": 10,
   "max_backoff_seconds": 3600,
-  "refresh_skew_seconds": 300,
   "log_level": "INFO"
 }
 ```
 
-`refresh_urls`, `oauth_client_id`, and `refresh_user_agent` are also
-overridable. Defaults match Claude Code today: refresh against both
-`platform.claude.com` and `console.anthropic.com` in order, public
-Claude Code client ID, exporter-versioned User-Agent. Most operators
-leave them at defaults.
-
-`credentials_path` must point at a file with the Claude Code creds
-shape:
+`credentials_path` must point at a file with the bearer-token shape:
 
 ```json
-{"claudeAiOauth": {"accessToken": "<token>"}}
+{"claudeAiOauth": {"accessToken": "sk-ant-oat01-...", "expiresAt": 1811116800000}}
 ```
+
+`expiresAt` is optional. When absent, `claude_quota_access_token_expires_at_seconds`
+is not emitted.
 
 ## Fetch throttling
 

@@ -6,8 +6,6 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from claude_quota_exporter import __version__
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "127.0.0.1"
@@ -17,13 +15,6 @@ DEFAULT_FETCH_TTL_SECONDS = 120
 DEFAULT_FETCH_TIMEOUT_SECONDS = 10
 DEFAULT_MAX_BACKOFF_SECONDS = 3600
 DEFAULT_LOG_LEVEL = "INFO"
-DEFAULT_REFRESH_SKEW_SECONDS = 300
-DEFAULT_REFRESH_URLS = [
-    "https://platform.claude.com/v1/oauth/token",
-    "https://console.anthropic.com/v1/oauth/token",
-]
-DEFAULT_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-DEFAULT_REFRESH_USER_AGENT = f"claude-quota-exporter/{__version__}"
 
 
 @dataclass
@@ -37,10 +28,6 @@ class Settings:
     fetch_timeout_seconds: int = DEFAULT_FETCH_TIMEOUT_SECONDS
     max_backoff_seconds: int = DEFAULT_MAX_BACKOFF_SECONDS
     log_level: str = DEFAULT_LOG_LEVEL
-    refresh_skew_seconds: int = DEFAULT_REFRESH_SKEW_SECONDS
-    refresh_urls: list[str] = field(default_factory=lambda: list(DEFAULT_REFRESH_URLS))
-    oauth_client_id: str = DEFAULT_OAUTH_CLIENT_ID
-    refresh_user_agent: str = DEFAULT_REFRESH_USER_AGENT
 
     @classmethod
     def from_config(cls, *, config_path: Path) -> "Settings":
@@ -79,16 +66,4 @@ class Settings:
                 data.get("max_backoff_seconds", DEFAULT_MAX_BACKOFF_SECONDS)
             ),
             log_level=str(data.get("log_level", DEFAULT_LOG_LEVEL)).upper(),
-            refresh_skew_seconds=int(
-                data.get("refresh_skew_seconds", DEFAULT_REFRESH_SKEW_SECONDS)
-            ),
-            refresh_urls=(
-                list(data["refresh_urls"])
-                if isinstance(data.get("refresh_urls"), list)
-                else list(DEFAULT_REFRESH_URLS)
-            ),
-            oauth_client_id=str(data.get("oauth_client_id", DEFAULT_OAUTH_CLIENT_ID)),
-            refresh_user_agent=str(
-                data.get("refresh_user_agent", DEFAULT_REFRESH_USER_AGENT)
-            ),
         )

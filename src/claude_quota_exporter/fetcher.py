@@ -5,10 +5,11 @@ Self-throttling: TTL gates how often a fetch attempt is made; exponential
 backoff suppresses retries after consecutive failures. Cache the last
 successful response in memory; the exporter scrape path reads the cache.
 
-OAuth-token rotation is delegated to ``auth.py``. Fetcher holds the
-current Credentials, runs proactive refresh when expiry is within
-``refresh_skew_seconds``, and runs expiry-gated reactive refresh when
-the usage endpoint returns 401.
+The bearer token is read from a credentials JSON file once at startup.
+There is no token-refresh flow — rotation is a manual operator action
+(re-run ``scripts/mint-creds.sh`` or ``claude setup-token``). Operators
+alert on ``claude_quota_access_token_expires_at_seconds`` approaching
+``now``.
 """
 
 import json
@@ -43,8 +44,8 @@ def _iso_to_epoch_seconds(value: object) -> float | None:
 def extract_buckets(raw: dict) -> dict[str, dict[str, float | None]]:
     """Extract every bucket from the raw API response.
 
-    A bucket is any top-level dict value containing `utilization` and
-    `resets_at`. Utilization is normalized from the API's 0..100 scale
+    A bucket is any top-level dict value containing ``utilization`` and
+    ``resets_at``. Utilization is normalized from the API's 0..100 scale
     to a 0..1 ratio. resets_at is normalized from ISO-8601 to epoch
     seconds.
     """
@@ -94,7 +95,7 @@ def fetch_from_api(*, token: str, timeout_seconds: int) -> FetchResult:
 
 
 class Fetcher:
-    """Throttled fetcher with in-memory cache and OAuth refresh."""
+    """Throttled fetcher with in-memory cache."""
 
     def __init__(
         self,
@@ -103,51 +104,31 @@ class Fetcher:
         ttl_seconds: int,
         timeout_seconds: int,
         max_backoff_seconds: int,
-        refresh_skew_seconds: int,
-        refresh_urls: list[str],
-        oauth_client_id: str,
-        refresh_user_agent: str,
     ) -> None:
         self._credentials_path = credentials_path
         self._ttl_seconds = ttl_seconds
         self._timeout_seconds = timeout_seconds
         self._max_backoff_seconds = max_backoff_seconds
-        self._refresh_skew_seconds = refresh_skew_seconds
-        self._refresh_urls = refresh_urls
-        self._oauth_client_id = oauth_client_id
-        self._refresh_user_agent = refresh_user_agent
         self._lock = threading.Lock()
         self._last_success_at: float = 0.0
         self._last_attempt_at: float = 0.0
-        self._last_refresh_at: float = 0.0
         self._consecutive_failures: int = 0
         self._success_count: int = 0
         self._failure_count: int = 0
-        self._refresh_success_count: int = 0
-        self._refresh_failure_count: int = 0
         self._cached_raw: dict | None = None
-        loaded = auth.read_credentials(credentials_path)
-        if loaded is None:
-            self._creds: Credentials | None = None
-            self._raw_creds_blob: dict = {}
+        self._creds: Credentials | None = auth.read_credentials(credentials_path)
+        if self._creds is None:
             logger.error(
                 "credentials_path not loadable at startup: %s "
                 "(see preceding WARNING for the specific reason); "
-                "refresh and fetch disabled until process restart",
+                "fetch disabled until process restart",
                 credentials_path,
             )
-        else:
-            self._creds, self._raw_creds_blob = loaded
-        self._credentials_writable = auth.is_writable(credentials_path)
         self._no_creds_logged: bool = False
 
     @property
     def last_success_at(self) -> float:
         return self._last_success_at
-
-    @property
-    def last_refresh_at(self) -> float:
-        return self._last_refresh_at
 
     @property
     def success_count(self) -> int:
@@ -158,28 +139,17 @@ class Fetcher:
         return self._failure_count
 
     @property
-    def refresh_success_count(self) -> int:
-        return self._refresh_success_count
-
-    @property
-    def refresh_failure_count(self) -> int:
-        return self._refresh_failure_count
-
-    @property
     def cached_raw(self) -> dict | None:
         return self._cached_raw
 
     @property
-    def credentials_writable(self) -> bool:
-        return self._credentials_writable
-
-    @property
     def access_token_expires_at(self) -> float | None:
-        return self._creds.expires_at if self._creds is not None else None
-
-    @property
-    def refresh_token_issued_at(self) -> float | None:
-        return self._creds.issued_at if self._creds is not None else None
+        """Epoch seconds when the bearer expires, or None if untracked."""
+        if self._creds is None:
+            return None
+        if self._creds.expires_at == 0.0:
+            return None
+        return self._creds.expires_at
 
     def has_credentials(self) -> bool:
         return self._creds is not None
@@ -207,36 +177,11 @@ class Fetcher:
                 return False
         return True
 
-    def _do_refresh(self) -> bool:
-        """Run a refresh, persist on success. Caller holds _lock."""
-        assert self._creds is not None
-        new_creds = auth.refresh(
-            refresh_token=self._creds.refresh_token,
-            urls=self._refresh_urls,
-            client_id=self._oauth_client_id,
-            user_agent=self._refresh_user_agent,
-            timeout_seconds=self._timeout_seconds,
-        )
-        if new_creds is None:
-            self._refresh_failure_count += 1
-            return False
-        self._creds = new_creds
-        self._last_refresh_at = time.time()
-        self._refresh_success_count += 1
-        if self._credentials_writable:
-            written = auth.write_back(
-                self._credentials_path, new_creds, self._raw_creds_blob
-            )
-            if not written:
-                self._credentials_writable = False
-                logger.warning("credentials write-back failed; running in-memory only")
-        return True
-
     def refresh_if_due(self) -> bool:
         """Attempt a fetch if TTL elapsed and not in backoff cooldown.
 
-        Returns True on a successful refresh, False otherwise (not due,
-        no token, or upstream failure).
+        Returns True on a successful fetch, False otherwise (not due,
+        no credentials, or upstream failure).
         """
         with self._lock:
             now = time.time()
@@ -245,36 +190,18 @@ class Fetcher:
             if self._creds is None:
                 if not self._no_creds_logged:
                     logger.warning(
-                        "credentials not loaded; skipping fetch and "
-                        "refresh. credentials_path=%s",
+                        "credentials not loaded; skipping fetch. "
+                        "credentials_path=%s",
                         self._credentials_path,
                     )
                     self._no_creds_logged = True
                 return False
-            # Proactive refresh: token within skew window.
-            if self._creds.expires_at - now < self._refresh_skew_seconds:
-                self._do_refresh()
             self._last_attempt_at = now
-            assert self._creds is not None
             result = fetch_from_api(
                 token=self._creds.access_token,
                 timeout_seconds=self._timeout_seconds,
             )
             raw = result.payload
-            if raw is None and result.status == 401:
-                now_after = time.time()
-                expiry_gap = self._creds.expires_at - now_after
-                refreshed_recently = (
-                    now_after - self._last_refresh_at
-                ) <= self._refresh_skew_seconds
-                if expiry_gap <= self._refresh_skew_seconds and not refreshed_recently:
-                    if self._do_refresh():
-                        retry = fetch_from_api(
-                            token=self._creds.access_token,
-                            timeout_seconds=self._timeout_seconds,
-                        )
-                        result = retry
-                        raw = retry.payload
             if raw is None:
                 self._consecutive_failures += 1
                 self._failure_count += 1

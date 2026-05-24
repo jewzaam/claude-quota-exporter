@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./mint/**)",
+      "Read(./mint)",
+      "Glob(./mint/**)",
+      "Glob(./mint)",
+      "Grep(./mint/**)",
+      "Grep(./mint)",
+      "Bash(* mint *)",
+      "Bash(* mint/*)",
+      "Bash(* */mint/*)"
+    ]
+  }
+}
