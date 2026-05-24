@@ -4,6 +4,11 @@
 Self-throttling: TTL gates how often a fetch attempt is made; exponential
 backoff suppresses retries after consecutive failures. Cache the last
 successful response in memory; the exporter scrape path reads the cache.
+
+OAuth-token rotation is delegated to ``auth.py``. Fetcher holds the
+current Credentials, runs proactive refresh when expiry is within
+``refresh_skew_seconds``, and runs expiry-gated reactive refresh when
+the usage endpoint returns 401.
 """
 
 import json
@@ -12,8 +17,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+from claude_quota_exporter import auth
+from claude_quota_exporter.auth import Credentials
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +36,7 @@ def _iso_to_epoch_seconds(value: object) -> float | None:
         return None
     try:
         return datetime.fromisoformat(value).timestamp()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):  # fmt: skip
         return None
 
 
@@ -54,26 +63,16 @@ def extract_buckets(raw: dict) -> dict[str, dict[str, float | None]]:
     return out
 
 
-def read_token(*, credentials_path: Path) -> str | None:
-    """Read the OAuth access token from the credentials file.
+@dataclass(frozen=True)
+class FetchResult:
+    """Outcome of a single GET /api/oauth/usage call."""
 
-    Expected shape: {"claudeAiOauth": {"accessToken": "..."}}
-    """
-    try:
-        data = json.loads(credentials_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError, OSError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    section = data.get("claudeAiOauth")
-    if not isinstance(section, dict):
-        return None
-    token = section.get("accessToken")
-    return token if isinstance(token, str) and token else None
+    status: int  # HTTP status; 0 means transport error before any response
+    payload: dict | None  # parsed body on 2xx, else None
 
 
-def fetch_from_api(*, token: str, timeout_seconds: int) -> dict | None:
-    """Perform the upstream API call. Return parsed dict or None on failure."""
+def fetch_from_api(*, token: str, timeout_seconds: int) -> FetchResult:
+    """Perform the upstream API call. Return a FetchResult."""
     req = urllib.request.Request(
         API_URL,
         headers={
@@ -84,16 +83,18 @@ def fetch_from_api(*, token: str, timeout_seconds: int) -> dict | None:
     try:
         with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
             data = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return FetchResult(status=exc.code, payload=None)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         logger.warning("limits API fetch failed: %s", exc)
-        return None
+        return FetchResult(status=0, payload=None)
     if isinstance(data, dict):
-        return data
-    return None
+        return FetchResult(status=200, payload=data)
+    return FetchResult(status=200, payload=None)
 
 
 class Fetcher:
-    """Throttled fetcher with in-memory cache."""
+    """Throttled fetcher with in-memory cache and OAuth refresh."""
 
     def __init__(
         self,
@@ -102,22 +103,51 @@ class Fetcher:
         ttl_seconds: int,
         timeout_seconds: int,
         max_backoff_seconds: int,
+        refresh_skew_seconds: int,
+        refresh_urls: list[str],
+        oauth_client_id: str,
+        refresh_user_agent: str,
     ) -> None:
         self._credentials_path = credentials_path
         self._ttl_seconds = ttl_seconds
         self._timeout_seconds = timeout_seconds
         self._max_backoff_seconds = max_backoff_seconds
+        self._refresh_skew_seconds = refresh_skew_seconds
+        self._refresh_urls = refresh_urls
+        self._oauth_client_id = oauth_client_id
+        self._refresh_user_agent = refresh_user_agent
         self._lock = threading.Lock()
         self._last_success_at: float = 0.0
         self._last_attempt_at: float = 0.0
+        self._last_refresh_at: float = 0.0
         self._consecutive_failures: int = 0
         self._success_count: int = 0
         self._failure_count: int = 0
+        self._refresh_success_count: int = 0
+        self._refresh_failure_count: int = 0
         self._cached_raw: dict | None = None
+        loaded = auth.read_credentials(credentials_path)
+        if loaded is None:
+            self._creds: Credentials | None = None
+            self._raw_creds_blob: dict = {}
+            logger.error(
+                "credentials_path not loadable at startup: %s "
+                "(see preceding WARNING for the specific reason); "
+                "refresh and fetch disabled until process restart",
+                credentials_path,
+            )
+        else:
+            self._creds, self._raw_creds_blob = loaded
+        self._credentials_writable = auth.is_writable(credentials_path)
+        self._no_creds_logged: bool = False
 
     @property
     def last_success_at(self) -> float:
         return self._last_success_at
+
+    @property
+    def last_refresh_at(self) -> float:
+        return self._last_refresh_at
 
     @property
     def success_count(self) -> int:
@@ -128,8 +158,31 @@ class Fetcher:
         return self._failure_count
 
     @property
+    def refresh_success_count(self) -> int:
+        return self._refresh_success_count
+
+    @property
+    def refresh_failure_count(self) -> int:
+        return self._refresh_failure_count
+
+    @property
     def cached_raw(self) -> dict | None:
         return self._cached_raw
+
+    @property
+    def credentials_writable(self) -> bool:
+        return self._credentials_writable
+
+    @property
+    def access_token_expires_at(self) -> float | None:
+        return self._creds.expires_at if self._creds is not None else None
+
+    @property
+    def refresh_token_issued_at(self) -> float | None:
+        return self._creds.issued_at if self._creds is not None else None
+
+    def has_credentials(self) -> bool:
+        return self._creds is not None
 
     def _backoff_seconds(self) -> float:
         if self._consecutive_failures == 0:
@@ -154,6 +207,31 @@ class Fetcher:
                 return False
         return True
 
+    def _do_refresh(self) -> bool:
+        """Run a refresh, persist on success. Caller holds _lock."""
+        assert self._creds is not None
+        new_creds = auth.refresh(
+            refresh_token=self._creds.refresh_token,
+            urls=self._refresh_urls,
+            client_id=self._oauth_client_id,
+            user_agent=self._refresh_user_agent,
+            timeout_seconds=self._timeout_seconds,
+        )
+        if new_creds is None:
+            self._refresh_failure_count += 1
+            return False
+        self._creds = new_creds
+        self._last_refresh_at = time.time()
+        self._refresh_success_count += 1
+        if self._credentials_writable:
+            written = auth.write_back(
+                self._credentials_path, new_creds, self._raw_creds_blob
+            )
+            if not written:
+                self._credentials_writable = False
+                logger.warning("credentials write-back failed; running in-memory only")
+        return True
+
     def refresh_if_due(self) -> bool:
         """Attempt a fetch if TTL elapsed and not in backoff cooldown.
 
@@ -164,28 +242,49 @@ class Fetcher:
             now = time.time()
             if not self._is_due(now=now):
                 return False
-
-            token = read_token(credentials_path=self._credentials_path)
-            if token is None:
-                logger.debug(
-                    "no OAuth token at %s; skip fetch",
-                    self._credentials_path,
-                )
+            if self._creds is None:
+                if not self._no_creds_logged:
+                    logger.warning(
+                        "credentials not loaded; skipping fetch and "
+                        "refresh. credentials_path=%s",
+                        self._credentials_path,
+                    )
+                    self._no_creds_logged = True
                 return False
-
+            # Proactive refresh: token within skew window.
+            if self._creds.expires_at - now < self._refresh_skew_seconds:
+                self._do_refresh()
             self._last_attempt_at = now
-            raw = fetch_from_api(token=token, timeout_seconds=self._timeout_seconds)
-
+            assert self._creds is not None
+            result = fetch_from_api(
+                token=self._creds.access_token,
+                timeout_seconds=self._timeout_seconds,
+            )
+            raw = result.payload
+            if raw is None and result.status == 401:
+                now_after = time.time()
+                expiry_gap = self._creds.expires_at - now_after
+                refreshed_recently = (
+                    now_after - self._last_refresh_at
+                ) <= self._refresh_skew_seconds
+                if expiry_gap <= self._refresh_skew_seconds and not refreshed_recently:
+                    if self._do_refresh():
+                        retry = fetch_from_api(
+                            token=self._creds.access_token,
+                            timeout_seconds=self._timeout_seconds,
+                        )
+                        result = retry
+                        raw = retry.payload
             if raw is None:
                 self._consecutive_failures += 1
                 self._failure_count += 1
                 logger.warning(
-                    "limits fetch failed attempts=%d backoff=%.0fs",
+                    "limits fetch failed status=%d attempts=%d backoff=%.0fs",
+                    result.status,
                     self._consecutive_failures,
                     self._backoff_seconds(),
                 )
                 return False
-
             self._cached_raw = raw
             self._last_success_at = time.time()
             self._consecutive_failures = 0

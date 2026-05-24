@@ -2,12 +2,14 @@
 """Tests for the Prometheus collector."""
 
 import json
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 from prometheus_client import CollectorRegistry, generate_latest
 
-from claude_quota_exporter.fetcher import Fetcher
+from claude_quota_exporter.auth import Credentials
+from claude_quota_exporter.fetcher import FetchResult, Fetcher
 from claude_quota_exporter.metrics import QuotaCollector
 
 SAMPLE_RAW = {
@@ -26,10 +28,21 @@ SAMPLE_RAW = {
 }
 
 
-def _make_fetcher(tmp_path: Path) -> Fetcher:
+def _make_fetcher(tmp_path: Path, expires_at: float | None = None) -> Fetcher:
     creds = tmp_path / "creds.json"
     creds.write_text(
-        json.dumps({"claudeAiOauth": {"accessToken": "tk"}}),
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-AAA",
+                    "refreshToken": "sk-ant-ort01-BBB",
+                    "expiresAt": int(
+                        (expires_at if expires_at is not None else time.time() + 7200)
+                        * 1000
+                    ),
+                }
+            }
+        ),
         encoding="utf-8",
     )
     return Fetcher(
@@ -37,6 +50,10 @@ def _make_fetcher(tmp_path: Path) -> Fetcher:
         ttl_seconds=120,
         timeout_seconds=5,
         max_backoff_seconds=3600,
+        refresh_skew_seconds=300,
+        refresh_urls=["https://example.invalid/v1/oauth/token"],
+        oauth_client_id="cid",
+        refresh_user_agent="ua",
     )
 
 
@@ -46,11 +63,21 @@ def _render(fetcher: Fetcher) -> str:
     return generate_latest(reg).decode("utf-8")
 
 
+def _ok(payload: dict | None = None) -> FetchResult:
+    return FetchResult(status=200, payload=payload or SAMPLE_RAW)
+
+
+def _fail(status: int = 0) -> FetchResult:
+    return FetchResult(status=status, payload=None)
+
+
 class TestQuotaCollector:
     def test_empty_cache_emits_definitions_only(self, tmp_path: Path) -> None:
-        # Block the in-collector refresh attempt.
         f = _make_fetcher(tmp_path)
-        with patch("claude_quota_exporter.fetcher.fetch_from_api", return_value=None):
+        with patch(
+            "claude_quota_exporter.fetcher.fetch_from_api",
+            return_value=_fail(),
+        ):
             out = _render(f)
         assert "claude_quota_utilization" in out
         assert "claude_quota_resets_at_seconds" in out
@@ -60,7 +87,7 @@ class TestQuotaCollector:
         f = _make_fetcher(tmp_path)
         with patch(
             "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=SAMPLE_RAW,
+            return_value=_ok(),
         ):
             out = _render(f)
         assert 'claude_quota_utilization{bucket="five_hour"} 0.11' in out
@@ -80,7 +107,65 @@ class TestQuotaCollector:
         }
         with patch(
             "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=novel,
+            return_value=_ok(novel),
         ):
             out = _render(f)
         assert 'claude_quota_utilization{bucket="novel_bucket"} 0.5' in out
+
+
+class TestRefreshMetrics:
+    def test_all_new_series_emitted(self, tmp_path: Path) -> None:
+        f = _make_fetcher(tmp_path)
+        with patch(
+            "claude_quota_exporter.fetcher.fetch_from_api",
+            return_value=_ok(),
+        ):
+            out = _render(f)
+        assert "claude_quota_refresh_success_total 0.0" in out
+        assert "claude_quota_refresh_failure_total 0.0" in out
+        assert "claude_quota_credentials_present 1.0" in out
+        assert "claude_quota_credentials_writable" in out
+        assert "claude_quota_access_token_expires_at_seconds" in out
+        assert "claude_quota_refresh_token_issued_at_seconds" in out
+        assert "claude_quota_last_refresh_timestamp_seconds" in out
+
+    def test_creds_absent_omits_token_gauges(self, tmp_path: Path) -> None:
+        f = Fetcher(
+            credentials_path=tmp_path / "missing.json",
+            ttl_seconds=120,
+            timeout_seconds=5,
+            max_backoff_seconds=3600,
+            refresh_skew_seconds=300,
+            refresh_urls=["https://example.invalid/v1/oauth/token"],
+            oauth_client_id="cid",
+            refresh_user_agent="ua",
+        )
+        with patch(
+            "claude_quota_exporter.fetcher.fetch_from_api",
+            return_value=_fail(),
+        ):
+            out = _render(f)
+        assert "claude_quota_credentials_present 0.0" in out
+        # HELP line present, but no series line (no add_metric call).
+        assert "# HELP claude_quota_access_token_expires_at_seconds" in out
+
+    def test_refresh_success_counter_increments(self, tmp_path: Path) -> None:
+        f = _make_fetcher(tmp_path, expires_at=time.time() + 60)
+        new_creds = Credentials(
+            access_token="new",
+            refresh_token="new-rt",
+            expires_at=time.time() + 7200,
+            issued_at=time.time(),
+        )
+        with (
+            patch(
+                "claude_quota_exporter.fetcher.auth.refresh",
+                return_value=new_creds,
+            ),
+            patch(
+                "claude_quota_exporter.fetcher.fetch_from_api",
+                return_value=_ok(),
+            ),
+        ):
+            out = _render(f)
+        assert "claude_quota_refresh_success_total 1.0" in out

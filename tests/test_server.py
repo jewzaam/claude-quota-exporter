@@ -23,9 +23,19 @@ SAMPLE_RAW = {
 
 @pytest.fixture
 def server_ctx(tmp_path: Path):
+    import time as _time
+
     creds = tmp_path / "creds.json"
     creds.write_text(
-        json.dumps({"claudeAiOauth": {"accessToken": "tk"}}),
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-AAA",
+                    "refreshToken": "sk-ant-ort01-BBB",
+                    "expiresAt": int((_time.time() + 7200) * 1000),
+                }
+            }
+        ),
         encoding="utf-8",
     )
     fetcher = Fetcher(
@@ -33,6 +43,10 @@ def server_ctx(tmp_path: Path):
         ttl_seconds=120,
         timeout_seconds=5,
         max_backoff_seconds=3600,
+        refresh_skew_seconds=300,
+        refresh_urls=["https://example.invalid/v1/oauth/token"],
+        oauth_client_id="cid",
+        refresh_user_agent="ua",
     )
     registry = CollectorRegistry()
     registry.register(QuotaCollector(fetcher=fetcher))
@@ -84,31 +98,29 @@ class TestRoutes:
         assert status == 200
         assert "ok" in body
 
-    def test_readyz_503_before_first_fetch(self, server_ctx) -> None:
+    def test_readyz_200_when_credentials_loaded_no_fetch_yet(self, server_ctx) -> None:
         fetcher, port = server_ctx
-        with patch("claude_quota_exporter.fetcher.fetch_from_api", return_value=None):
-            status, _ = _get(port, "/readyz")
-        # No successful fetch has occurred.
+        assert fetcher.has_credentials() is True
         assert fetcher.last_success_at == 0.0
-        assert status == 503
-
-    def test_readyz_200_after_first_fetch(self, server_ctx) -> None:
-        fetcher, port = server_ctx
-        with patch(
-            "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=SAMPLE_RAW,
-        ):
-            # /metrics scrape triggers the fetch.
-            _get(port, "/metrics")
-        assert fetcher.last_success_at > 0.0
-        status, _ = _get(port, "/readyz")
+        status, body = _get(port, "/readyz")
         assert status == 200
+        assert "ready" in body
+
+    def test_readyz_503_when_no_credentials(self, server_ctx) -> None:
+        fetcher, port = server_ctx
+        # Force creds to None to simulate cold start.
+        fetcher._creds = None
+        status, body = _get(port, "/readyz")
+        assert status == 503
+        assert "not ready" in body
 
     def test_metrics_endpoint_exposes_gauges(self, server_ctx) -> None:
+        from claude_quota_exporter.fetcher import FetchResult
+
         _, port = server_ctx
         with patch(
             "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=SAMPLE_RAW,
+            return_value=FetchResult(status=200, payload=SAMPLE_RAW),
         ):
             status, body = _get(port, "/metrics")
         assert status == 200

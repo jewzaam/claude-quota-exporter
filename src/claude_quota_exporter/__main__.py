@@ -104,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
         ttl_seconds=settings.fetch_ttl_seconds,
         timeout_seconds=settings.fetch_timeout_seconds,
         max_backoff_seconds=settings.max_backoff_seconds,
+        refresh_skew_seconds=settings.refresh_skew_seconds,
+        refresh_urls=settings.refresh_urls,
+        oauth_client_id=settings.oauth_client_id,
+        refresh_user_agent=settings.refresh_user_agent,
     )
     registry = CollectorRegistry()
     registry.register(QuotaCollector(fetcher=fetcher))
