@@ -42,54 +42,59 @@ Claude consumer (CI runner, agent, IDE, etc.).
 
 ## Authentication
 
-The exporter consumes a long-lived OAuth bearer token minted via
-`claude setup-token` (requires an active Claude Pro/Max subscription).
-Tokens are valid for approximately 1 year. The exporter does NOT
-refresh tokens — rotation is a manual operator action signalled by
-the `claude_quota_access_token_expires_at_seconds` gauge.
+The exporter is a dumb credential consumer. It reads a JSON file at
+startup, uses the bearer until the pod terminates. No refresh logic,
+no write-back, no Kubernetes-API access.
 
-### Mint a token
+**Required input.** A PKCE-login-derived OAuth access token (the
+`sk-ant-oat01-` shape stored in `~/.claude/.credentials.json` by
+`claude /login`). `claude setup-token` output does NOT work — it is
+scoped for the Anthropic Messages API and returns 403 against
+`/api/oauth/usage`.
 
-```sh
-make mint-creds                                 # writes ./mint/.credentials.json
-make mint-creds MINT_DIR=/secure/path           # override location
-make mint-creds MINT_TTL_DAYS=180               # override expiry
-```
-
-The script wraps `claude setup-token` (interactive — paste the URL
-into your browser, paste the returned code back into the terminal)
-and writes a `credentials.json` of the shape:
+File shape (only `accessToken` is read; sibling fields are tolerated
+but ignored):
 
 ```json
-{
-  "claudeAiOauth": {
-    "accessToken": "sk-ant-oat01-...",
-    "expiresAt": 1811116800000
-  }
-}
+{"claudeAiOauth": {"accessToken": "sk-ant-oat01-..."}}
 ```
 
-`expiresAt` is informational only — it records when you minted the
-token plus `MINT_TTL_DAYS` (default 365). The exporter does not act
-on it beyond emitting the gauge. Anthropic determines actual expiry
-server-side.
+Build the Secret directly from your workstation's existing creds:
 
-### Rotate
+```sh
+TOKEN=$(jq -r .claudeAiOauth.accessToken < ~/.claude/.credentials.json)
+echo "{\"claudeAiOauth\":{\"accessToken\":\"$TOKEN\"}}" \
+  | kubectl create secret generic claude-quota-exporter-credentials \
+      --from-file=credentials.json=/dev/stdin --dry-run=client -o yaml \
+  | kubectl apply -f -
+```
 
-Re-run `make mint-creds` and restart the exporter. Recommended alert:
-fire when `claude_quota_access_token_expires_at_seconds - time() <
-30 * 86400` (30 days from expiry).
+### Rotation in Kubernetes
 
-### Why no refresh
+The exporter Deployment is annotated `reloader.stakater.com/auto: "true"`.
+Install [stakater/Reloader](https://github.com/stakater/Reloader) in
+the cluster; it watches the mounted Secret and rolls the Deployment
+whenever the Secret content changes. The new pod reads the fresh
+bearer.
 
-The first iteration of the exporter implemented the full OAuth
-refresh-token grant. It was over-engineered for this use case — the
-long-lived bearer is simpler, dodges the per-refresh-token rate-limit
-bucket on `/v1/oauth/token`, and matches Anthropic's headless-tool
-guidance (the `CLAUDE_CODE_OAUTH_TOKEN` env var pattern). The full
-refresh design is preserved in
+How the Secret stays fresh is a separate concern owned by a rotator
+workload — manual `kubectl apply`, a CronJob calling Anthropic's
+`/v1/oauth/token` refresh grant, External Secrets Operator syncing
+from Vault/AWS-SM/etc. The exporter does not care.
+
+### Why no refresh logic in the exporter
+
+Refresh-token rotation is a stateful credential-management concern.
+The k8s-native answer is "external workload updates the Secret +
+Reloader rolls the Deployment". The exporter has no business
+touching `/v1/oauth/token`, holding refresh tokens, or writing back
+to mounted Secrets (tmpfs projection makes in-pod write-back invisible
+across restarts anyway).
+
+An earlier iteration implemented the full OAuth refresh-token grant
+inline; the design is preserved in
 [docs/superpowers/specs/2026-05-24-oauth-refresh-design.md](docs/superpowers/specs/2026-05-24-oauth-refresh-design.md)
-for reference.
+for reference but is not the current shape.
 
 ## Metrics
 
@@ -100,7 +105,6 @@ for reference.
 | `claude_quota_fetch_success_total`            | counter | —         | Successful upstream fetches.                |
 | `claude_quota_fetch_failure_total`            | counter | —         | Failed upstream fetches.                    |
 | `claude_quota_last_fetch_timestamp_seconds`   | gauge   | —         | Unix epoch of the last successful fetch.    |
-| `claude_quota_access_token_expires_at_seconds`| gauge   | —         | Unix epoch when the bearer token expires (informational; omitted when creds absent or expiresAt not set). |
 | `claude_quota_credentials_present`            | gauge   | —         | `1` if a valid credentials file is loaded, else `0`. |
 
 Buckets are discovered dynamically — every top-level dict in the API
@@ -162,11 +166,8 @@ working file before editing — `config.local.json` is gitignored.
 `credentials_path` must point at a file with the bearer-token shape:
 
 ```json
-{"claudeAiOauth": {"accessToken": "sk-ant-oat01-...", "expiresAt": 1811116800000}}
+{"claudeAiOauth": {"accessToken": "sk-ant-oat01-..."}}
 ```
-
-`expiresAt` is optional. When absent, `claude_quota_access_token_expires_at_seconds`
-is not emitted.
 
 ## Fetch throttling
 

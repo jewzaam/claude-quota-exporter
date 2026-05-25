@@ -107,12 +107,10 @@ class TestRoutes:
         assert "not ready" in body
 
     def test_metrics_endpoint_exposes_gauges(self, server_ctx) -> None:
-        from claude_quota_exporter.fetcher import FetchResult
-
         _, port = server_ctx
         with patch(
             "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=FetchResult(status=200, payload=SAMPLE_RAW),
+            return_value=SAMPLE_RAW,
         ):
             status, body = _get(port, "/metrics")
         assert status == 200

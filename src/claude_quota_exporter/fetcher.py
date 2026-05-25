@@ -6,10 +6,8 @@ backoff suppresses retries after consecutive failures. Cache the last
 successful response in memory; the exporter scrape path reads the cache.
 
 The bearer token is read from a credentials JSON file once at startup.
-There is no token-refresh flow — rotation is a manual operator action
-(re-run ``scripts/mint-creds.sh`` or ``claude setup-token``). Operators
-alert on ``claude_quota_access_token_expires_at_seconds`` approaching
-``now``.
+There is no token-refresh flow — rotation is an external concern
+(see CLAUDE.md). Operators alert on rising fetch_failure_total.
 """
 
 import json
@@ -18,7 +16,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -64,16 +61,8 @@ def extract_buckets(raw: dict) -> dict[str, dict[str, float | None]]:
     return out
 
 
-@dataclass(frozen=True)
-class FetchResult:
-    """Outcome of a single GET /api/oauth/usage call."""
-
-    status: int  # HTTP status; 0 means transport error before any response
-    payload: dict | None  # parsed body on 2xx, else None
-
-
-def fetch_from_api(*, token: str, timeout_seconds: int) -> FetchResult:
-    """Perform the upstream API call. Return a FetchResult."""
+def fetch_from_api(*, token: str, timeout_seconds: int) -> dict | None:
+    """Perform the upstream API call. Return parsed dict or None on failure."""
     req = urllib.request.Request(
         API_URL,
         headers={
@@ -84,14 +73,16 @@ def fetch_from_api(*, token: str, timeout_seconds: int) -> FetchResult:
     try:
         with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
             data = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        return FetchResult(status=exc.code, payload=None)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as exc:
         logger.warning("limits API fetch failed: %s", exc)
-        return FetchResult(status=0, payload=None)
+        return None
     if isinstance(data, dict):
-        return FetchResult(status=200, payload=data)
-    return FetchResult(status=200, payload=None)
+        return data
+    return None
 
 
 class Fetcher:
@@ -142,15 +133,6 @@ class Fetcher:
     def cached_raw(self) -> dict | None:
         return self._cached_raw
 
-    @property
-    def access_token_expires_at(self) -> float | None:
-        """Epoch seconds when the bearer expires, or None if untracked."""
-        if self._creds is None:
-            return None
-        if self._creds.expires_at == 0.0:
-            return None
-        return self._creds.expires_at
-
     def has_credentials(self) -> bool:
         return self._creds is not None
 
@@ -197,17 +179,15 @@ class Fetcher:
                     self._no_creds_logged = True
                 return False
             self._last_attempt_at = now
-            result = fetch_from_api(
+            raw = fetch_from_api(
                 token=self._creds.access_token,
                 timeout_seconds=self._timeout_seconds,
             )
-            raw = result.payload
             if raw is None:
                 self._consecutive_failures += 1
                 self._failure_count += 1
                 logger.warning(
-                    "limits fetch failed status=%d attempts=%d backoff=%.0fs",
-                    result.status,
+                    "limits fetch failed attempts=%d backoff=%.0fs",
                     self._consecutive_failures,
                     self._backoff_seconds(),
                 )

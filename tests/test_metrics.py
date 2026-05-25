@@ -2,13 +2,12 @@
 """Tests for the Prometheus collector."""
 
 import json
-import time
 from pathlib import Path
 from unittest.mock import patch
 
 from prometheus_client import CollectorRegistry, generate_latest
 
-from claude_quota_exporter.fetcher import FetchResult, Fetcher
+from claude_quota_exporter.fetcher import Fetcher
 from claude_quota_exporter.metrics import QuotaCollector
 
 SAMPLE_RAW = {
@@ -27,12 +26,12 @@ SAMPLE_RAW = {
 }
 
 
-def _make_fetcher(tmp_path: Path, expires_at: float | None = None) -> Fetcher:
+def _make_fetcher(tmp_path: Path) -> Fetcher:
     creds = tmp_path / "creds.json"
-    blob: dict = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-AAA"}}
-    if expires_at is not None:
-        blob["claudeAiOauth"]["expiresAt"] = int(expires_at * 1000)
-    creds.write_text(json.dumps(blob), encoding="utf-8")
+    creds.write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-AAA"}}),
+        encoding="utf-8",
+    )
     return Fetcher(
         credentials_path=creds,
         ttl_seconds=120,
@@ -47,20 +46,12 @@ def _render(fetcher: Fetcher) -> str:
     return generate_latest(reg).decode("utf-8")
 
 
-def _ok(payload: dict | None = None) -> FetchResult:
-    return FetchResult(status=200, payload=payload or SAMPLE_RAW)
-
-
-def _fail(status: int = 0) -> FetchResult:
-    return FetchResult(status=status, payload=None)
-
-
 class TestQuotaCollector:
     def test_empty_cache_emits_definitions_only(self, tmp_path: Path) -> None:
         f = _make_fetcher(tmp_path)
         with patch(
             "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=_fail(),
+            return_value=None,
         ):
             out = _render(f)
         assert "claude_quota_utilization" in out
@@ -71,7 +62,7 @@ class TestQuotaCollector:
         f = _make_fetcher(tmp_path)
         with patch(
             "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=_ok(),
+            return_value=SAMPLE_RAW,
         ):
             out = _render(f)
         assert 'claude_quota_utilization{bucket="five_hour"} 0.11' in out
@@ -91,18 +82,18 @@ class TestQuotaCollector:
         }
         with patch(
             "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=_ok(novel),
+            return_value=novel,
         ):
             out = _render(f)
         assert 'claude_quota_utilization{bucket="novel_bucket"} 0.5' in out
 
 
-class TestExpiryAndPresenceMetrics:
+class TestCredentialsPresenceMetric:
     def test_creds_present_when_loaded(self, tmp_path: Path) -> None:
         f = _make_fetcher(tmp_path)
         with patch(
             "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=_ok(),
+            return_value=SAMPLE_RAW,
         ):
             out = _render(f)
         assert "claude_quota_credentials_present 1.0" in out
@@ -116,41 +107,7 @@ class TestExpiryAndPresenceMetrics:
         )
         with patch(
             "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=_fail(),
+            return_value=None,
         ):
             out = _render(f)
         assert "claude_quota_credentials_present 0.0" in out
-        # HELP line present, but no series value (no add_metric call).
-        assert "# HELP claude_quota_access_token_expires_at_seconds" in out
-
-    def test_expires_at_emitted_when_set(self, tmp_path: Path) -> None:
-        target = time.time() + 31536000  # +1 year
-        f = _make_fetcher(tmp_path, expires_at=target)
-        with patch(
-            "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=_ok(),
-        ):
-            out = _render(f)
-        assert "claude_quota_access_token_expires_at_seconds" in out
-        # Verify the value line is present (not just HELP/TYPE).
-        assert (
-            f"claude_quota_access_token_expires_at_seconds {target}" in out
-            or "claude_quota_access_token_expires_at_seconds " in out
-        )
-
-    def test_expires_at_omitted_when_zero(self, tmp_path: Path) -> None:
-        # Minimum-viable creds: no expiresAt → no series line, only HELP.
-        f = _make_fetcher(tmp_path)
-        with patch(
-            "claude_quota_exporter.fetcher.fetch_from_api",
-            return_value=_ok(),
-        ):
-            out = _render(f)
-        assert "# HELP claude_quota_access_token_expires_at_seconds" in out
-        # No value-line (no `add_metric` was called).
-        lines = [
-            line
-            for line in out.splitlines()
-            if line.startswith("claude_quota_access_token_expires_at_seconds ")
-        ]
-        assert lines == []
