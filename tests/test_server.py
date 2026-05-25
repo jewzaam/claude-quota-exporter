@@ -100,8 +100,9 @@ class TestRoutes:
 
     def test_readyz_503_when_no_credentials(self, server_ctx) -> None:
         fetcher, port = server_ctx
-        # Force creds to None to simulate cold start.
-        fetcher._creds = None
+        # Remove the creds file so the next live read fails. The fetcher
+        # re-reads on every has_credentials() call.
+        fetcher._credentials_path.unlink()
         status, body = _get(port, "/readyz")
         assert status == 503
         assert "not ready" in body

@@ -5,12 +5,6 @@ metadata:
   name: claude-quota-exporter
   labels:
     app.kubernetes.io/name: claude-quota-exporter
-  annotations:
-    # stakater/Reloader: roll the Deployment whenever the mounted
-    # credentials Secret content changes. The exporter is a dumb
-    # consumer — it reads creds at startup and never refreshes.
-    # Rotation is owned by whatever workload updates the Secret.
-    reloader.stakater.com/auto: "true"
 spec:
   replicas: 1
   strategy:
@@ -31,7 +25,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: exporter
-          image: claude-quota-exporter:0.1.0
+          image: claude-quota-exporter:0.2.0
           imagePullPolicy: IfNotPresent
           args:
             - --config

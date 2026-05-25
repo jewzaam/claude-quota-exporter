@@ -5,23 +5,40 @@ pod, one token, scrape-driven.
 
 ## Conventions and gotchas
 
-- **Exporter is a dumb credential consumer.** Reads creds at startup,
-  uses the bearer until the pod terminates. No refresh, no
-  write-back, no Kubernetes-API access. Rotation is OWNED BY THE
-  ROTATOR — a separate workload (operator's manual `kubectl apply`,
-  a CronJob, External Secrets Operator, whatever) that updates the
-  mounted Secret. The Deployment carries
-  `reloader.stakater.com/auto: "true"`; stakater/Reloader watches
-  the Secret and rolls the Deployment on content change. New pod
-  starts, reads fresh creds. Do not add refresh logic, write-back
-  logic, or k8s-API code to this exporter — that complexity belongs
-  in the rotator workload, not here.
+- **Exporter is a dumb credential consumer.** Re-reads the credentials
+  file from disk on every fetch attempt (each `/metrics` scrape that
+  crosses TTL) and on every `has_credentials()` call (readyz +
+  credentials_present metric). No refresh, no write-back, no
+  Kubernetes-API access. Rotation is OWNED BY THE ROTATOR — a
+  separate workload (operator's manual `kubectl apply`, a CronJob,
+  External Secrets Operator, whatever) that updates the mounted
+  Secret. Because the fetcher re-reads each cycle, the next scrape
+  picks up the new bearer with no pod restart needed — Stakater
+  Reloader is no longer required and was removed from the Deployment
+  in 0.2.0. Do not add refresh logic, write-back logic, or k8s-API
+  code to this exporter — that complexity belongs in the rotator
+  workload, not here.
+- **Live credential re-read invariants** (since 0.2.0). Every code
+  path that touches credential state goes through
+  `Fetcher._load_current_credentials()`, called under `self._lock`.
+  That helper logs at WARNING when crossing the good→bad boundary
+  (or when creds are unloadable on the very first check) and at
+  INFO when crossing bad→good or on the first successful load.
+  [src/claude_quota_exporter/auth.py](src/claude_quota_exporter/auth.py)
+  `read_credentials()` logs the specific parse/IO failure at WARNING
+  on every call — keep it at WARNING even though the function is now
+  polled. The failure modes (missing file, dir-not-file, malformed
+  JSON, missing accessToken) are critical startup signals and must
+  surface in pod logs. Steady-bad state is intentionally loud; the
+  alternative (DEBUG) would hide the root cause from operators
+  diagnosing a never-started exporter. Fetcher transition logs sit
+  on top to add the "fetch disabled / restored" operator context
+  that auth.py cannot infer on its own.
 - **Bearer source must be PKCE-login-derived.** The required input
   is an `accessToken` from a `~/.claude/.credentials.json` shape
   (interactive `claude /login` flow). The 245c8e9 design path used
   the refresh-token grant against this same shape; we sidestepped
-  the entire refresh feature in 815c164 because Stakater Reloader +
-  external rotator handle the lifecycle. The design in
+  the entire refresh feature in 815c164. The design in
   [docs/superpowers/specs/2026-05-24-oauth-refresh-design.md](docs/superpowers/specs/2026-05-24-oauth-refresh-design.md)
   is preserved as historical context only.
 - Token-vs-endpoint compatibility matrix. The `sk-ant-oat01-` prefix
@@ -59,11 +76,13 @@ pod, one token, scrape-driven.
   § 4.13 recommends single-use rotation with invalidation as a
   theft-detection defense; whether Anthropic enforces it is unknown
   (the 2-call test was blocked by rate limit).
-- K8s Secret mounts are tmpfs projections. Kubelet re-projects on
-  pod restart. Combined with `reloader.stakater.com/auto: "true"`,
-  any Secret content change triggers a Deployment rollout → new pod
-  reads fresh creds. The exporter has zero in-process refresh, so
-  the tmpfs reset is the rotation transport.
+- K8s Secret mounts are tmpfs projections. Kubelet re-projects when
+  the Secret content changes; the file under
+  `/var/run/claude/credentials.json` swaps atomically. The fetcher
+  re-reads on every quota-fetch attempt, so the next scrape after
+  re-projection picks up the new bearer with no pod restart and no
+  Deployment rollout. The exporter has zero in-process refresh and
+  no longer carries a Reloader annotation (removed in 0.2.0).
 - Do not run `claude auth login` inside a bare `node:22-slim`
   container expecting `.credentials.json` to land on disk. Claude
   Code on Linux targets the OS keychain (libsecret / `secret-tool` /
