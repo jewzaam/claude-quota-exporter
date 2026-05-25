@@ -5,6 +5,73 @@ pod, one token, scrape-driven.
 
 ## Conventions and gotchas
 
+- **Exporter is a dumb credential consumer.** Reads creds at startup,
+  uses the bearer until the pod terminates. No refresh, no
+  write-back, no Kubernetes-API access. Rotation is OWNED BY THE
+  ROTATOR — a separate workload (operator's manual `kubectl apply`,
+  a CronJob, External Secrets Operator, whatever) that updates the
+  mounted Secret. The Deployment carries
+  `reloader.stakater.com/auto: "true"`; stakater/Reloader watches
+  the Secret and rolls the Deployment on content change. New pod
+  starts, reads fresh creds. Do not add refresh logic, write-back
+  logic, or k8s-API code to this exporter — that complexity belongs
+  in the rotator workload, not here.
+- **Bearer source must be PKCE-login-derived.** The required input
+  is an `accessToken` from a `~/.claude/.credentials.json` shape
+  (interactive `claude /login` flow). The 245c8e9 design path used
+  the refresh-token grant against this same shape; we sidestepped
+  the entire refresh feature in 815c164 because Stakater Reloader +
+  external rotator handle the lifecycle. The design in
+  [docs/superpowers/specs/2026-05-24-oauth-refresh-design.md](docs/superpowers/specs/2026-05-24-oauth-refresh-design.md)
+  is preserved as historical context only.
+- Token-vs-endpoint compatibility matrix. The `sk-ant-oat01-` prefix
+  is shared across multiple Anthropic OAuth token types; same prefix
+  does NOT mean same scope. Empirical matrix (verified this session):
+  PKCE-login access token (from interactive `claude /login` →
+  `~/.claude/.credentials.json`) returns 200 on `/api/oauth/usage`;
+  `claude setup-token` output (intended for `CLAUDE_CODE_OAUTH_TOKEN`
+  env var, designed for `/v1/messages`) returns 403 on
+  `/api/oauth/usage`. For this exporter only PKCE-login access
+  tokens are valid input — setup-token output is the wrong credential
+  entirely despite the matching prefix.
+- Anthropic OAuth error envelopes are NOT RFC-6749 shape.
+  `/v1/oauth/token` returns nested errors like
+  `{"error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}`,
+  not the RFC-6749 flat
+  `{"error":"rate_limit"}`. Any parser in
+  [src/claude_quota_exporter/auth.py](src/claude_quota_exporter/auth.py)
+  must read `.error.type`, not `.error`. The `_extract_oauth_error()`
+  helper in commit 245c8e9 had this bug (looked for top-level `error`
+  as a string only) — re-introduce it carefully when restoring the
+  refresh design.
+- Anthropic `/v1/oauth/token` 429 responses include NO `Retry-After`
+  header (verified via `curl -D -` 2026-05-24 22:08:12 GMT). The
+  Cloudflare `__cf_bm` cookie's `Expires` is bot-management noise,
+  not a rate-limit hint. There is no clean look-but-don't-touch probe
+  to detect when the limit clears — any probe that triggers the gate
+  consumes whatever bucket budget applies. See
+  [scripts/wait-for-rate-limit-clear.sh](scripts/wait-for-rate-limit-clear.sh)
+  for the chosen approach (exponential-backoff sleep + real refresh,
+  accepting that a successful probe consumes a rotation).
+- Refresh-token invalidation policy after rotation is UNVERIFIED.
+  Not the exporter's concern (rotator owns refresh), but a
+  consideration for whoever builds the rotator workload. OAuth 2.1
+  § 4.13 recommends single-use rotation with invalidation as a
+  theft-detection defense; whether Anthropic enforces it is unknown
+  (the 2-call test was blocked by rate limit).
+- K8s Secret mounts are tmpfs projections. Kubelet re-projects on
+  pod restart. Combined with `reloader.stakater.com/auto: "true"`,
+  any Secret content change triggers a Deployment rollout → new pod
+  reads fresh creds. The exporter has zero in-process refresh, so
+  the tmpfs reset is the rotation transport.
+- Do not run `claude auth login` inside a bare `node:22-slim`
+  container expecting `.credentials.json` to land on disk. Claude
+  Code on Linux targets the OS keychain (libsecret / `secret-tool` /
+  `gnome-keyring-daemon`); a slim container has no keyring service.
+  The login flow runs and creates supporting directories under
+  `~/.claude` (e.g. `backups/`) but writes no `.credentials.json`.
+  Run `claude /login` on a workstation that has a keyring instead,
+  then copy the resulting bearer into the exporter's mounted Secret.
 - Bind host defaults to loopback. `DEFAULT_HOST = "127.0.0.1"` lives at
   [src/claude_quota_exporter/config.py:11](src/claude_quota_exporter/config.py).
   Override to `0.0.0.0` only inside a pod-network scrape boundary; the
@@ -48,27 +115,6 @@ pod, one token, scrape-driven.
   status, success/failure). Review checklist before merging changes
   to `auth.py` or `fetcher.py`: grep both files for `access_token`
   as a `%s` argument to a logger — should return nothing.
-- No OAuth refresh. The exporter takes a long-lived bearer minted
-  via `claude setup-token` (1-year lifetime). Rotation is a manual
-  operator action. The `claude_quota_access_token_expires_at_seconds`
-  gauge is the alert signal — fire when value − now drops below
-  ~30 days. Re-mint via `make mint-creds`, restart the exporter.
-- Mint exporter-scoped credentials with `make mint-creds`. Wraps
-  [scripts/mint-creds.sh](scripts/mint-creds.sh) which calls
-  `claude setup-token` (interactive — paste URL into browser, paste
-  returned code back) and captures the `sk-ant-oat01-*` bearer via
-  `claude setup-token 2>&1 | grep sk-ant-oat01 | sed 's/[[:space:]]//g'`.
-  Writes `./mint/.credentials.json` with `expiresAt = now + MINT_TTL_DAYS*86400*1000`
-  (default 365 days). The `expiresAt` is informational only — feeds
-  the `claude_quota_access_token_expires_at_seconds` gauge so
-  operators can alert on rotation deadline. Anthropic decides actual
-  expiry server-side.
-- [.claude/settings.json](.claude/settings.json) denies
-  `Read(./mint/**)` / `Glob(./mint/**)` / `Grep(./mint/**)` plus
-  shell variants for every Claude Code agent working in this repo —
-  do not lift those denies. The exporter consumes
-  `./mint/.credentials.json` directly; never copy its contents into
-  the repo or into chat.
 
 ## Entry points
 

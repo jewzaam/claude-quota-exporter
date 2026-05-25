@@ -1,5 +1,4 @@
 {
-  "_comment": "Template. Copy to a gitignored working file (e.g. config.local.json) before editing. Bind 127.0.0.1 by default; override to 0.0.0.0 only inside a pod-network scrape boundary.",
   "host": "127.0.0.1",
   "port": 9180,
   "credentials_path": "/var/run/claude/credentials.json",

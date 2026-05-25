@@ -2,23 +2,18 @@
 """Tests for auth.py — Credentials and read_credentials."""
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
-
-import pytest
 
 from claude_quota_exporter.auth import Credentials, read_credentials
 
 
 def _full_creds_blob(
     access: str = "sk-ant-oat01-AAA",
-    expires_at_ms: int = 1779580800694,
     extras: dict | None = None,
 ) -> dict:
     payload: dict = {
         "claudeAiOauth": {
             "accessToken": access,
-            "expiresAt": expires_at_ms,
         }
     }
     if extras:
@@ -27,51 +22,22 @@ def _full_creds_blob(
 
 
 class TestReadCredentials:
-    def test_happy_path_ms_expires(self, tmp_path: Path) -> None:
+    def test_happy_path(self, tmp_path: Path) -> None:
         p = tmp_path / "creds.json"
         p.write_text(json.dumps(_full_creds_blob()), encoding="utf-8")
         creds = read_credentials(p)
         assert creds is not None
         assert isinstance(creds, Credentials)
         assert creds.access_token == "sk-ant-oat01-AAA"
-        assert creds.expires_at == pytest.approx(1779580800.694)
-
-    def test_iso_string_expires(self, tmp_path: Path) -> None:
-        p = tmp_path / "creds.json"
-        blob = _full_creds_blob()
-        blob["claudeAiOauth"]["expiresAt"] = "2026-04-13T07:00:00+00:00"
-        p.write_text(json.dumps(blob), encoding="utf-8")
-        creds = read_credentials(p)
-        assert creds is not None
-        expected = datetime(2026, 4, 13, 7, 0, 0, tzinfo=timezone.utc).timestamp()
-        assert creds.expires_at == pytest.approx(expected)
-
-    def test_expires_at_optional_defaults_to_zero(self, tmp_path: Path) -> None:
-        # Minimum-viable creds: just accessToken.
-        p = tmp_path / "creds.json"
-        p.write_text(
-            json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-AAA"}}),
-            encoding="utf-8",
-        )
-        creds = read_credentials(p)
-        assert creds is not None
-        assert creds.access_token == "sk-ant-oat01-AAA"
-        assert creds.expires_at == 0.0
-
-    def test_unparseable_expires_at_defaults_to_zero(self, tmp_path: Path) -> None:
-        blob = _full_creds_blob()
-        blob["claudeAiOauth"]["expiresAt"] = "not a date"
-        p = tmp_path / "creds.json"
-        p.write_text(json.dumps(blob), encoding="utf-8")
-        creds = read_credentials(p)
-        assert creds is not None
-        assert creds.expires_at == 0.0
 
     def test_unknown_sibling_fields_are_ignored(self, tmp_path: Path) -> None:
+        # expiresAt, refreshToken, scopes etc. are tolerated but
+        # silently dropped — the exporter consumes only accessToken.
         p = tmp_path / "creds.json"
         blob = _full_creds_blob(
             extras={
                 "refreshToken": "sk-ant-ort01-IGNORED",
+                "expiresAt": 1779580800694,
                 "scopes": ["user:profile"],
                 "subscriptionType": "max",
             }
@@ -79,8 +45,6 @@ class TestReadCredentials:
         p.write_text(json.dumps(blob), encoding="utf-8")
         creds = read_credentials(p)
         assert creds is not None
-        # Only accessToken + expiresAt are loaded; siblings are
-        # silently dropped (we never write back).
         assert creds.access_token == "sk-ant-oat01-AAA"
 
     def test_missing_file_returns_none(self, tmp_path: Path) -> None:
@@ -99,7 +63,7 @@ class TestReadCredentials:
     def test_missing_access_token_returns_none(self, tmp_path: Path) -> None:
         p = tmp_path / "creds.json"
         p.write_text(
-            json.dumps({"claudeAiOauth": {"expiresAt": 0}}),
+            json.dumps({"claudeAiOauth": {}}),
             encoding="utf-8",
         )
         assert read_credentials(p) is None

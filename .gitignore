@@ -28,6 +28,3 @@ venv/
 # Local config / secrets
 config.local.json
 *.credentials.json
-
-# Exporter-scoped OAuth credentials minted via `make mint-creds`
-/mint/

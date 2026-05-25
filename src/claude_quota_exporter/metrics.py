@@ -73,15 +73,6 @@ class QuotaCollector(Collector):
         last_fetch.add_metric([], self._fetcher.last_success_at)
         yield last_fetch
 
-        access_expiry = GaugeMetricFamily(
-            "claude_quota_access_token_expires_at_seconds",
-            "Unix epoch seconds when the current OAuth bearer expires",
-        )
-        token_expiry = self._fetcher.access_token_expires_at
-        if token_expiry is not None:
-            access_expiry.add_metric([], token_expiry)
-        yield access_expiry
-
         creds_present = GaugeMetricFamily(
             "claude_quota_credentials_present",
             "1 if a valid credentials file is loaded, else 0",
