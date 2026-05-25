@@ -42,9 +42,11 @@ Claude consumer (CI runner, agent, IDE, etc.).
 
 ## Authentication
 
-The exporter is a dumb credential consumer. It reads a JSON file at
-startup, uses the bearer until the pod terminates. No refresh logic,
-no write-back, no Kubernetes-API access.
+The exporter is a dumb credential consumer. It re-reads the bearer
+from a JSON file on every fetch attempt. No refresh logic, no
+write-back, no Kubernetes-API access. Live re-read means an external
+rotator can replace the file contents and the next scrape picks up
+the new bearer without a pod restart.
 
 **Required input.** A PKCE-login-derived OAuth access token (the
 `sk-ant-oat01-` shape stored in `~/.claude/.credentials.json` by
@@ -71,11 +73,9 @@ echo "{\"claudeAiOauth\":{\"accessToken\":\"$TOKEN\"}}" \
 
 ### Rotation in Kubernetes
 
-The exporter Deployment is annotated `reloader.stakater.com/auto: "true"`.
-Install [stakater/Reloader](https://github.com/stakater/Reloader) in
-the cluster; it watches the mounted Secret and rolls the Deployment
-whenever the Secret content changes. The new pod reads the fresh
-bearer.
+Update the mounted Secret. Kubelet re-projects the tmpfs mount; the
+next `/metrics` scrape re-reads the file and uses the new bearer.
+No pod restart, no controller, no in-process state.
 
 How the Secret stays fresh is a separate concern owned by a rotator
 workload — manual `kubectl apply`, a CronJob calling Anthropic's
@@ -85,8 +85,8 @@ from Vault/AWS-SM/etc. The exporter does not care.
 ### Why no refresh logic in the exporter
 
 Refresh-token rotation is a stateful credential-management concern.
-The k8s-native answer is "external workload updates the Secret +
-Reloader rolls the Deployment". The exporter has no business
+The k8s-native answer is "external workload updates the Secret;
+exporter re-reads on next scrape". The exporter has no business
 touching `/v1/oauth/token`, holding refresh tokens, or writing back
 to mounted Secrets (tmpfs projection makes in-pod write-back invisible
 across restarts anyway).
@@ -194,7 +194,7 @@ make build-image
 docker run --rm -p 9180:9180 \
   -v /path/to/credentials.json:/var/run/claude/credentials.json:ro \
   -v $(pwd)/config.example.json:/etc/claude-quota-exporter/config.json:ro \
-  claude-quota-exporter:0.1.0
+  claude-quota-exporter:0.2.0
 ```
 
 ## Kubernetes
@@ -226,8 +226,10 @@ applying.
 
 ### Config / Secret reload
 
-The exporter reads its ConfigMap and Secret once at process start.
-Trigger a manual rollout when the mounted content changes:
+The exporter re-reads the credentials Secret on every fetch attempt,
+so Secret rotation needs no pod restart. The ConfigMap is read once
+at process start; trigger a manual rollout when the ConfigMap
+content changes:
 
 ```sh
 kubectl -n $NS rollout restart deployment/claude-quota-exporter

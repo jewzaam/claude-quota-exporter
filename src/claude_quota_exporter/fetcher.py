@@ -5,9 +5,10 @@ Self-throttling: TTL gates how often a fetch attempt is made; exponential
 backoff suppresses retries after consecutive failures. Cache the last
 successful response in memory; the exporter scrape path reads the cache.
 
-The bearer token is read from a credentials JSON file once at startup.
-There is no token-refresh flow — rotation is an external concern
-(see CLAUDE.md). Operators alert on rising fetch_failure_total.
+The bearer token is re-read from the credentials JSON file on every
+fetch attempt. There is no token-refresh flow — rotation is an external
+concern (an external workload replaces the file contents). The exporter
+picks up the new bearer on the next scrape with no pod restart needed.
 """
 
 import json
@@ -107,15 +108,8 @@ class Fetcher:
         self._success_count: int = 0
         self._failure_count: int = 0
         self._cached_raw: dict | None = None
-        self._creds: Credentials | None = auth.read_credentials(credentials_path)
-        if self._creds is None:
-            logger.error(
-                "credentials_path not loadable at startup: %s "
-                "(see preceding WARNING for the specific reason); "
-                "fetch disabled until process restart",
-                credentials_path,
-            )
-        self._no_creds_logged: bool = False
+        self._last_creds_ok: bool = False
+        self._creds_check_done: bool = False
 
     @property
     def last_success_at(self) -> float:
@@ -134,7 +128,45 @@ class Fetcher:
         return self._cached_raw
 
     def has_credentials(self) -> bool:
-        return self._creds is not None
+        """Live check that the credentials file is currently loadable.
+
+        Performs a fresh disk read on every call so readiness probes and
+        the credentials_present metric reflect the present state, not a
+        cached startup snapshot.
+        """
+        with self._lock:
+            return self._load_current_credentials() is not None
+
+    def _load_current_credentials(self) -> Credentials | None:
+        """Read credentials from disk and log good/bad transitions.
+
+        Caller must hold ``self._lock``. Logs WARNING on bad→good→bad
+        transitions and INFO on the initial successful load and on
+        bad→good recoveries. Steady-state is silent.
+        """
+        creds = auth.read_credentials(self._credentials_path)
+        ok = creds is not None
+        if not self._creds_check_done:
+            self._creds_check_done = True
+            if ok:
+                logger.info("credentials loaded: %s", self._credentials_path)
+            else:
+                logger.warning(
+                    "credentials not loadable at startup: %s — "
+                    "fetch disabled until file becomes readable",
+                    self._credentials_path,
+                )
+        elif ok != self._last_creds_ok:
+            if ok:
+                logger.info("credentials restored: %s", self._credentials_path)
+            else:
+                logger.warning(
+                    "credentials became unloadable: %s — "
+                    "fetch disabled until file becomes readable",
+                    self._credentials_path,
+                )
+        self._last_creds_ok = ok
+        return creds
 
     def _backoff_seconds(self) -> float:
         if self._consecutive_failures == 0:
@@ -163,24 +195,19 @@ class Fetcher:
         """Attempt a fetch if TTL elapsed and not in backoff cooldown.
 
         Returns True on a successful fetch, False otherwise (not due,
-        no credentials, or upstream failure).
+        no credentials, or upstream failure). Credentials are re-read
+        from disk on every call so rotation requires no pod restart.
         """
         with self._lock:
             now = time.time()
+            creds = self._load_current_credentials()
             if not self._is_due(now=now):
                 return False
-            if self._creds is None:
-                if not self._no_creds_logged:
-                    logger.warning(
-                        "credentials not loaded; skipping fetch. "
-                        "credentials_path=%s",
-                        self._credentials_path,
-                    )
-                    self._no_creds_logged = True
+            if creds is None:
                 return False
             self._last_attempt_at = now
             raw = fetch_from_api(
-                token=self._creds.access_token,
+                token=creds.access_token,
                 timeout_seconds=self._timeout_seconds,
             )
             if raw is None:

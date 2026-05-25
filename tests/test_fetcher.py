@@ -170,6 +170,88 @@ class TestFetcherRefresh:
         assert f._consecutive_failures == 0
         assert f.success_count == 1
 
+    def test_creds_appear_mid_flight(self, tmp_path: Path) -> None:
+        # Start with no creds file. First refresh skips. Then drop the
+        # file in place; next refresh picks it up with no restart.
+        creds_path = tmp_path / "creds.json"
+        f = Fetcher(
+            credentials_path=creds_path,
+            ttl_seconds=120,
+            timeout_seconds=5,
+            max_backoff_seconds=3600,
+        )
+        with patch(
+            "claude_quota_exporter.fetcher.fetch_from_api",
+            return_value=SAMPLE_RAW,
+        ) as mock:
+            assert f.refresh_if_due() is False
+            mock.assert_not_called()
+            assert f.has_credentials() is False
+            creds_path.write_text(
+                json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-AAA"}}),
+                encoding="utf-8",
+            )
+            assert f.has_credentials() is True
+            assert f.refresh_if_due() is True
+        assert f.cached_raw == SAMPLE_RAW
+        assert f.success_count == 1
+
+    def test_creds_disappear_mid_flight_retains_cache(self, tmp_path: Path) -> None:
+        # Successful fetch populates cache. Remove the creds file; the
+        # next attempt skips without clearing the cache. Operators keep
+        # serving last-known-good values via /metrics.
+        f = _make_fetcher(tmp_path, ttl=0)
+        with patch(
+            "claude_quota_exporter.fetcher.fetch_from_api",
+            return_value=SAMPLE_RAW,
+        ) as mock:
+            assert f.refresh_if_due() is True
+        assert f.cached_raw == SAMPLE_RAW
+
+        f._credentials_path.unlink()
+        with patch(
+            "claude_quota_exporter.fetcher.fetch_from_api",
+            return_value=SAMPLE_RAW,
+        ) as mock:
+            assert f.refresh_if_due() is False
+            mock.assert_not_called()
+        assert f.cached_raw == SAMPLE_RAW
+        assert f.has_credentials() is False
+
+    def test_has_credentials_reflects_live_state(self, tmp_path: Path) -> None:
+        f = _make_fetcher(tmp_path)
+        assert f.has_credentials() is True
+        f._credentials_path.unlink()
+        assert f.has_credentials() is False
+        f._credentials_path.write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-BBB"}}),
+            encoding="utf-8",
+        )
+        assert f.has_credentials() is True
+
+    def test_rotated_token_used_on_next_fetch(self, tmp_path: Path) -> None:
+        # Token swapped on disk between fetches. Second fetch uses the
+        # new value, proving no in-memory bearer cache survives across
+        # calls.
+        f = _make_fetcher(tmp_path, ttl=0)
+        seen: list[str] = []
+
+        def _capture(*, token: str, timeout_seconds: int) -> dict:
+            seen.append(token)
+            return SAMPLE_RAW
+
+        with patch(
+            "claude_quota_exporter.fetcher.fetch_from_api",
+            side_effect=_capture,
+        ):
+            assert f.refresh_if_due() is True
+            f._credentials_path.write_text(
+                json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-ROTATED"}}),
+                encoding="utf-8",
+            )
+            assert f.refresh_if_due() is True
+        assert seen == ["sk-ant-oat01-AAA", "sk-ant-oat01-ROTATED"]
+
 
 class TestFetchFromApi:
     def test_success_returns_dict(self) -> None:
