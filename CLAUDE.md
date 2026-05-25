@@ -115,6 +115,38 @@ pod, one token, scrape-driven.
   status, success/failure). Review checklist before merging changes
   to `auth.py` or `fetcher.py`: grep both files for `access_token`
   as a `%s` argument to a logger — should return nothing.
+- GHCR push requires a CLASSIC PAT with `write:packages` scope. The
+  `make push-image` target pushes to
+  `ghcr.io/jewzaam/claude-quota-exporter`. Fine-grained Personal
+  Access Tokens DO NOT support GHCR write — there is no Packages
+  permission in the fine-grained token UI (verified against
+  https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens
+  which lists no Packages permission; community feature request open
+  in https://github.com/orgs/community/discussions/36441). Classic
+  PATs cannot be scoped to a single repository — the token can push
+  to ANY of your user-owned packages. For per-repo scoping, the only
+  option is a GitHub Actions workflow using the auto-issued
+  `GITHUB_TOKEN` (scoped to the repo's own packages, requires
+  `permissions: packages: write` in the workflow). Manual workstation
+  push: classic PAT with short expiry, treat as broad blast radius.
+- Dockerfile carries
+  `LABEL org.opencontainers.image.source="https://github.com/jewzaam/claude-quota-exporter"`
+  (see [deploy/Dockerfile](deploy/Dockerfile)). GHCR reads this label
+  after first push and auto-links the published package to the source
+  repo, surfacing it in the repo's Packages sidebar and enabling
+  provenance attestation. Do not remove the LABEL; do not point it at
+  a different URL.
+- `$(abspath ...)` on container bind-mount paths in the
+  [Makefile](Makefile). The `run-image` target wraps both mount
+  sources in `$(abspath $(CREDS_FILE))` /
+  `$(abspath $(IMAGE_CONFIG_FILE))`. This defends against Git Bash
+  MSYS2 colon-mangling on Windows: a relative path passed to
+  `podman run -v ./path:/container/path:ro` gets rewritten to
+  `\Program Files\Git\path;ro` by MSYS2's bash-to-Windows path
+  conversion, corrupting the mount spec. The fix is making the
+  host-side path absolute before `podman` sees it. Do not regress to
+  raw `$(CREDS_FILE)` etc. in any new container-running Makefile
+  target — wrap in `$(abspath ...)`.
 
 ## Entry points
 
